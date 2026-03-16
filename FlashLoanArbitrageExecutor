@@ -1,0 +1,562 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/**
+ * @title FlashLoanArbitrageExecutor
+ * @dev Flash loan arbitrage executor for multi-chain trading
+ * Integrates with Aave, Uniswap V2/V3, and other DEXes
+ */
+
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+
+interface IAaveLendingPool {
+    function flashLoan(
+        address receiverAddress,
+        address[] calldata assets,
+        uint256[] calldata amounts,
+        uint256[] calldata modes,
+        address onBehalfOf,
+        bytes calldata params,
+        uint16 referralCode
+    ) external;
+}
+
+interface IUniswapV2Router {
+    function swapExactTokensForTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external returns (uint[] memory amounts);
+    
+    function getAmountsOut(uint amountIn, address[] calldata path) 
+        external view returns (uint[] memory amounts);
+}
+
+interface IUniswapV3Router {
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+    
+    function exactInputSingle(ExactInputSingleParams calldata params)
+        external payable returns (uint256 amountOut);
+}
+
+contract FlashLoanArbitrageExecutor is Ownable, ReentrancyGuard {
+    using SafeMath for uint256;
+    
+    // DEX addresses (Ethereum mainnet)
+    address public constant AAVE_LENDING_POOL = 0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9;
+    address public constant UNISWAP_V2_ROUTER = 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
+    address public constant UNISWAP_V3_ROUTER = 0xE592427A0AEce92De3Edee1F18E0157C05861564;
+    address public constant SUSHISWAP_ROUTER = 0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F;
+    
+    // Token addresses
+    address public constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address public constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
+    address public constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+    address public constant DAI = 0x6B175474E89094C44Da98b954EedeAC495271d0F;
+    
+    // Arbitrage opportunities
+    struct ArbitrageOpportunity {
+        address tokenIn;
+        address tokenOut;
+        address dexBuy;
+        address dexSell;
+        uint256 expectedProfit;
+        uint256 minProfit;
+        bool isValid;
+    }
+    
+    // Trade execution
+    struct TradeExecution {
+        uint256 amountIn;
+        uint256 amountOut;
+        uint256 profit;
+        uint256 timestamp;
+        address executor;
+        bool success;
+    }
+    
+    // State
+    mapping(address => uint256) public profits;
+    mapping(address => uint256) public totalTrades;
+    TradeExecution[] public tradeHistory;
+    
+    uint256 public totalExecutedTrades;
+    uint256 public totalProfits;
+    uint256 public totalLosses;
+    
+    address public controller;
+    uint256 public feePercentage = 20; // 0.2% in basis points
+    
+    // Events
+    event FlashLoanExecuted(
+        address indexed executor,
+        address token,
+        uint256 amount,
+        uint256 profit,
+        uint256 timestamp
+    );
+    
+    event ArbitrageOpportunityFound(
+        address tokenIn,
+        address tokenOut,
+        uint256 expectedProfit,
+        uint256 timestamp
+    );
+    
+    event TradeExecuted(
+        address indexed executor,
+        uint256 amountIn,
+        uint256 amountOut,
+        uint256 profit,
+        bool success
+    );
+    
+    modifier onlyController() {
+        require(msg.sender == controller, "Only controller can call");
+        _;
+    }
+    
+    constructor(address _controller) Ownable(msg.sender) {
+        controller = _controller;
+    }
+    
+    // ==================== FLASH LOAN EXECUTION ====================
+    
+    /**
+     * @dev Execute flash loan arbitrage
+     */
+    function executeFlashLoanArbitrage(
+        address tokenBorrow,
+        uint256 borrowAmount,
+        address tokenBuy,
+        address tokenSell,
+        address dexBuy,
+        address dexSell,
+        uint256 minProfit
+    ) external nonReentrant returns (uint256 profit) {
+        require(borrowAmount > 0, "Invalid borrow amount");
+        require(minProfit > 0, "Invalid min profit");
+        
+        // Prepare assets for flash loan
+        address[] memory assets = new address[](1);
+        assets[0] = tokenBorrow;
+        
+        uint256[] memory amounts = new uint256[](1);
+        amounts[0] = borrowAmount;
+        
+        uint256[] memory modes = new uint256[](1);
+        modes[0] = 0; // 0 = no debt, 1 = stable, 2 = variable
+        
+        // Encode parameters for flash loan callback
+        bytes memory params = abi.encode(
+            msg.sender,
+            tokenBuy,
+            tokenSell,
+            dexBuy,
+            dexSell,
+            minProfit
+        );
+        
+        // Execute flash loan
+        IAaveLendingPool(AAVE_LENDING_POOL).flashLoan(
+            address(this),
+            assets,
+            amounts,
+            modes,
+            address(this),
+            params,
+            0
+        );
+        
+        // Calculate and distribute profit
+        profit = profits[msg.sender];
+        require(profit >= minProfit, "Profit below minimum");
+        
+        distributeProfit(msg.sender, profit);
+        
+        emit FlashLoanExecuted(
+            msg.sender,
+            tokenBorrow,
+            borrowAmount,
+            profit,
+            block.timestamp
+        );
+        
+        return profit;
+    }
+    
+    /**
+     * @dev Flash loan callback (Aave interface)
+     */
+    function executeOperation(
+        address[] calldata assets,
+        uint256[] calldata amounts,
+        uint256[] calldata premiums,
+        address initiator,
+        bytes calldata params
+    ) external returns (bool) {
+        require(msg.sender == AAVE_LENDING_POOL, "Only Aave can call");
+        require(initiator == address(this), "Invalid initiator");
+        
+        // Decode parameters
+        (
+            address executor,
+            address tokenBuy,
+            address tokenSell,
+            address dexBuy,
+            address dexSell,
+            uint256 minProfit
+        ) = abi.decode(params, (address, address, address, address, address, uint256));
+        
+        address tokenBorrow = assets[0];
+        uint256 borrowAmount = amounts[0];
+        uint256 premium = premiums[0];
+        
+        // Execute arbitrage
+        uint256 profit = executeArbitrage(
+            tokenBorrow,
+            borrowAmount,
+            tokenBuy,
+            tokenSell,
+            dexBuy,
+            dexSell,
+            premium
+        );
+        
+        // Store profit
+        profits[executor] = profit;
+        
+        // Approve Aave to take back loan + premium
+        uint256 amountOwed = borrowAmount.add(premium);
+        IERC20(tokenBorrow).approve(AAVE_LENDING_POOL, amountOwed);
+        
+        return true;
+    }
+    
+    // ==================== ARBITRAGE EXECUTION ====================
+    
+    /**
+     * @dev Execute arbitrage between two DEXes
+     */
+    function executeArbitrage(
+        address tokenIn,
+        uint256 amountIn,
+        address tokenBuy,
+        address tokenSell,
+        address dexBuy,
+        address dexSell,
+        uint256 premium
+    ) internal returns (uint256 profit) {
+        // Step 1: Buy on cheaper DEX
+        uint256 amountBought = executeSwap(
+            dexBuy,
+            tokenIn,
+            tokenBuy,
+            amountIn,
+            0 // Accept any amount for simplicity
+        );
+        
+        // Step 2: Sell on more expensive DEX
+        uint256 amountSold = executeSwap(
+            dexSell,
+            tokenBuy,
+            tokenIn,
+            amountBought,
+            0
+        );
+        
+        // Calculate profit after premium
+        profit = amountSold.sub(amountIn).sub(premium);
+        
+        // Record trade
+        TradeExecution memory trade = TradeExecution({
+            amountIn: amountIn,
+            amountOut: amountSold,
+            profit: profit,
+            timestamp: block.timestamp,
+            executor: msg.sender,
+            success: profit > 0
+        });
+        
+        tradeHistory.push(trade);
+        totalExecutedTrades++;
+        
+        if (profit > 0) {
+            totalProfits = totalProfits.add(profit);
+        } else {
+            totalLosses = totalLosses.add(profit.abs());
+        }
+        
+        totalTrades[msg.sender]++;
+        
+        emit TradeExecuted(
+            msg.sender,
+            amountIn,
+            amountSold,
+            profit,
+            profit > 0
+        );
+        
+        return profit;
+    }
+    
+    /**
+     * @dev Execute swap on specified DEX
+     */
+    function executeSwap(
+        address dexRouter,
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 minAmountOut
+    ) internal returns (uint256 amountOut) {
+        // Approve router to spend tokens
+        IERC20(tokenIn).approve(dexRouter, amountIn);
+        
+        if (dexRouter == UNISWAP_V2_ROUTER || dexRouter == SUSHISWAP_ROUTER) {
+            // Uniswap V2 or SushiSwap
+            address[] memory path = new address[](2);
+            path[0] = tokenIn;
+            path[1] = tokenOut;
+            
+            uint256 deadline = block.timestamp + 300;
+            
+            uint256[] memory amounts = IUniswapV2Router(dexRouter).swapExactTokensForTokens(
+                amountIn,
+                minAmountOut,
+                path,
+                address(this),
+                deadline
+            );
+            
+            amountOut = amounts[1];
+        } else if (dexRouter == UNISWAP_V3_ROUTER) {
+            // Uniswap V3
+            IUniswapV3Router.ExactInputSingleParams memory params = IUniswapV3Router
+                .ExactInputSingleParams({
+                    tokenIn: tokenIn,
+                    tokenOut: tokenOut,
+                    fee: 3000, // 0.3% fee tier
+                    recipient: address(this),
+                    deadline: block.timestamp + 300,
+                    amountIn: amountIn,
+                    amountOutMinimum: minAmountOut,
+                    sqrtPriceLimitX96: 0
+                });
+            
+            amountOut = IUniswapV3Router(dexRouter).exactInputSingle(params);
+        } else {
+            revert("Unsupported DEX");
+        }
+        
+        return amountOut;
+    }
+    
+    // ==================== ARBITRAGE DETECTION ====================
+    
+    /**
+     * @dev Find arbitrage opportunity between two DEXes
+     */
+    function findArbitrageOpportunity(
+        address tokenA,
+        address tokenB,
+        uint256 amount
+    ) external view returns (ArbitrageOpportunity memory opportunity) {
+        // Check Uniswap V2 -> SushiSwap
+        uint256 profitV2ToSushi = calculateArbitrageProfit(
+            tokenA,
+            tokenB,
+            amount,
+            UNISWAP_V2_ROUTER,
+            SUSHISWAP_ROUTER
+        );
+        
+        // Check SushiSwap -> Uniswap V2
+        uint256 profitSushiToV2 = calculateArbitrageProfit(
+            tokenA,
+            tokenB,
+            amount,
+            SUSHISWAP_ROUTER,
+            UNISWAP_V2_ROUTER
+        );
+        
+        // Select best opportunity
+        if (profitV2ToSushi > profitSushiToV2 && profitV2ToSushi > 0) {
+            opportunity = ArbitrageOpportunity({
+                tokenIn: tokenA,
+                tokenOut: tokenB,
+                dexBuy: UNISWAP_V2_ROUTER,
+                dexSell: SUSHISWAP_ROUTER,
+                expectedProfit: profitV2ToSushi,
+                minProfit: profitV2ToSushi.mul(90).div(100), // 10% slippage buffer
+                isValid: true
+            });
+        } else if (profitSushiToV2 > 0) {
+            opportunity = ArbitrageOpportunity({
+                tokenIn: tokenA,
+                tokenOut: tokenB,
+                dexBuy: SUSHISWAP_ROUTER,
+                dexSell: UNISWAP_V2_ROUTER,
+                expectedProfit: profitSushiToV2,
+                minProfit: profitSushiToV2.mul(90).div(100),
+                isValid: true
+            });
+        }
+        
+        if (opportunity.isValid) {
+            emit ArbitrageOpportunityFound(
+                tokenA,
+                tokenB,
+                opportunity.expectedProfit,
+                block.timestamp
+            );
+        }
+        
+        return opportunity;
+    }
+    
+    /**
+     * @dev Calculate arbitrage profit
+     */
+    function calculateArbitrageProfit(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        address dexBuy,
+        address dexSell
+    ) internal view returns (uint256 profit) {
+        try IUniswapV2Router(dexBuy).getAmountsOut(amountIn, getPath(tokenIn, tokenOut)) 
+            returns (uint256[] memory amountsBuy) {
+            uint256 amountBought = amountsBuy[1];
+            
+            try IUniswapV2Router(dexSell).getAmountsOut(amountBought, getPath(tokenOut, tokenIn))
+                returns (uint256[] memory amountsSell) {
+                uint256 amountSold = amountsSell[1];
+                
+                if (amountSold > amountIn) {
+                    profit = amountSold.sub(amountIn);
+                }
+            } catch {
+                profit = 0;
+            }
+        } catch {
+            profit = 0;
+        }
+        
+        return profit;
+    }
+    
+    // ==================== PROFIT DISTRIBUTION ====================
+    
+    /**
+     * @dev Distribute profit to executor
+     */
+    function distributeProfit(address executor, uint256 profit) internal {
+        uint256 fee = profit.mul(feePercentage).div(10000);
+        uint256 executorProfit = profit.sub(fee);
+        
+        // Transfer profit to executor
+        if (executorProfit > 0) {
+            // In reality, would transfer the actual profit token
+            // For simplicity, we just record it
+            profits[executor] = profits[executor].add(executorProfit);
+        }
+        
+        // Collect fee
+        if (fee > 0) {
+            // Transfer fee to owner
+            // IERC20(token).transfer(owner, fee);
+        }
+    }
+    
+    // ==================== HELPER FUNCTIONS ====================
+    
+    /**
+     * @dev Get token path for swap
+     */
+    function getPath(address tokenA, address tokenB) internal pure returns (address[] memory) {
+        address[] memory path = new address[](2);
+        path[0] = tokenA;
+        path[1] = tokenB;
+        return path;
+    }
+    
+    /**
+     * @dev Update controller address
+     */
+    function updateController(address newController) external onlyOwner {
+        controller = newController;
+    }
+    
+    /**
+     * @dev Update fee percentage
+     */
+    function updateFeePercentage(uint256 newFee) external onlyOwner {
+        require(newFee <= 100, "Fee too high"); // Max 1%
+        feePercentage = newFee;
+    }
+    
+    /**
+     * @dev Withdraw any stuck tokens
+     */
+    function withdrawStuckTokens(address token, uint256 amount) external onlyOwner {
+        IERC20(token).transfer(owner(), amount);
+    }
+    
+    /**
+     * @dev Get trade history count
+     */
+    function getTradeHistoryCount() external view returns (uint256) {
+        return tradeHistory.length;
+    }
+    
+    /**
+     * @dev Get trade by index
+     */
+    function getTrade(uint256 index) external view returns (
+        uint256 amountIn,
+        uint256 amountOut,
+        uint256 profit,
+        uint256 timestamp,
+        address executor,
+        bool success
+    ) {
+        require(index < tradeHistory.length, "Invalid index");
+        TradeExecution memory trade = tradeHistory[index];
+        
+        return (
+            trade.amountIn,
+            trade.amountOut,
+            trade.profit,
+            trade.timestamp,
+            trade.executor,
+            trade.success
+        );
+    }
+    
+    /**
+     * @dev Get executor stats
+     */
+    function getExecutorStats(address executor) external view returns (
+        uint256 totalProfit,
+        uint256 tradeCount,
+        uint256 successRate
+    ) {
+        // Simplified - in reality would track per executor
+        return (profits[executor], totalTrades[executor], 0);
+    }
+}
