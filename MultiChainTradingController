@@ -1,0 +1,808 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/**
+ * @title MultiChainTradingController
+ * @dev Main controller for multi-chain trading operations
+ * Features: Withdraw Tab, Auto Tab, Stop Button
+ * Supports: ETH, TRX, SOL, BNB, Polygon networks
+ * Designed for Remix IDE with clear UI tabs
+ */
+
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+
+contract MultiChainTradingController is Ownable, ReentrancyGuard {
+    using SafeMath for uint256;
+    using SafeMath for uint256;
+    
+    // Network IDs matching Remix tabs
+    enum Network {
+        ETHEREUM,
+        TRON,
+        SOLANA,
+        BNB,
+        POLYGON
+    }
+    
+    // Trading Status for Stop Button
+    enum TradingStatus {
+        STOPPED,
+        RUNNING,
+        PAUSED,
+        EMERGENCY
+    }
+    
+    // Token addresses for each network
+    struct NetworkConfig {
+        address nativeToken;
+        address usdtAddress;
+        address usdcAddress;
+        address wethAddress;
+        bool isActive;
+    }
+    
+    // User position for Withdraw Tab
+    struct UserPosition {
+        uint256 totalDeposited;
+        uint256 totalWithdrawn;
+        uint256 currentBalance;
+        uint256 lastTradeTime;
+        uint256 profitLoss;
+        bool isActive;
+    }
+    
+    // Auto trading parameters for Auto Tab
+    struct AutoTradeConfig {
+        uint256 minProfitThreshold;  // Minimum profit percentage (basis points)
+        uint256 maxTradeSize;        // Maximum trade size in USD
+        uint256 slippageTolerance;   // Slippage tolerance (basis points)
+        uint256 gasLimit;           // Gas limit for trades
+        bool useFlashLoans;         // Use flash loans for arbitrage
+        bool enabled;               // Auto trading enabled
+    }
+    
+    // State variables
+    mapping(Network => NetworkConfig) public networkConfigs;
+    mapping(address => UserPosition) public userPositions;
+    mapping(Network => mapping(address => uint256)) public networkBalances;
+    
+    TradingStatus public tradingStatus;
+    AutoTradeConfig public autoConfig;
+    
+    uint256 public totalTVL; // Total Value Locked
+    uint256 public totalProfits;
+    uint256 public totalTrades;
+    uint256 public lastUpdateTime;
+    
+    address public feeWallet;
+    uint256 public platformFee = 25; // 0.25% in basis points
+    
+    // Events for Remix UI updates
+    event Deposited(address indexed user, Network network, uint256 amount, address token);
+    event Withdrawn(address indexed user, Network network, uint256 amount, address token);
+    event AutoTradeExecuted(address indexed user, Network network, uint256 profit, uint256 timestamp);
+    event TradingStatusChanged(TradingStatus oldStatus, TradingStatus newStatus);
+    event EmergencyStopActivated(address indexed caller, string reason);
+    event AutoConfigUpdated(AutoTradeConfig newConfig);
+    event ProfitDistributed(address indexed user, uint256 amount);
+    
+    // Modifiers
+    modifier onlyWhenRunning() {
+        require(tradingStatus == TradingStatus.RUNNING, "Trading is not running");
+        _;
+    }
+    
+    modifier onlyWhenNotEmergency() {
+        require(tradingStatus != TradingStatus.EMERGENCY, "Emergency stop activated");
+        _;
+    }
+    
+    modifier validNetwork(Network network) {
+        require(networkConfigs[network].isActive, "Network not configured");
+        _;
+    }
+    
+    constructor(address _feeWallet) Ownable(msg.sender) {
+        feeWallet = _feeWallet;
+        tradingStatus = TradingStatus.STOPPED;
+        
+        // Initialize auto trading config
+        autoConfig = AutoTradeConfig({
+            minProfitThreshold: 50,     // 0.5%
+            maxTradeSize: 10000 ether,  // $10,000
+            slippageTolerance: 100,     // 1%
+            gasLimit: 500000,
+            useFlashLoans: true,
+            enabled: false
+        });
+    }
+    
+    // ==================== WITHDRAW TAB FUNCTIONS (For Remix UI) ====================
+    
+    /**
+     * @dev WITHDRAW TAB - Withdraw ETH from specific network
+     * Use in Remix: call withdrawETH(0, "1000000000000000000") for 1 ETH
+     */
+    function withdrawETH(
+        uint8 networkId,  // 0=ETHEREUM, 1=TRON, 2=SOLANA, 3=BNB, 4=POLYGON
+        uint256 amount
+    ) external nonReentrant onlyWhenNotEmergency {
+        Network network = Network(networkId);
+        require(networkConfigs[network].isActive, "Network not configured");
+        require(amount > 0, "Amount must be > 0");
+        
+        UserPosition storage position = userPositions[msg.sender];
+        require(position.currentBalance >= amount, "Insufficient balance");
+        
+        // Update balances
+        position.currentBalance = position.currentBalance.sub(amount);
+        position.totalWithdrawn = position.totalWithdrawn.add(amount);
+        networkBalances[network][address(0)] = networkBalances[network][address(0)].sub(amount);
+        totalTVL = totalTVL.sub(amount);
+        
+        // Transfer ETH
+        (bool success, ) = payable(msg.sender).call{value: amount}("");
+        require(success, "ETH transfer failed");
+        
+        emit Withdrawn(msg.sender, network, amount, address(0));
+    }
+    
+    /**
+     * @dev WITHDRAW TAB - Withdraw ERC20 token from specific network
+     * Use in Remix: call withdrawToken(0, "0xdAC17F958D2ee523a2206206994597C13D831ec7", "1000000")
+     */
+    function withdrawToken(
+        uint8 networkId,
+        address token,
+        uint256 amount
+    ) external nonReentrant onlyWhenNotEmergency {
+        Network network = Network(networkId);
+        require(networkConfigs[network].isActive, "Network not configured");
+        require(amount > 0, "Amount must be > 0");
+        
+        UserPosition storage position = userPositions[msg.sender];
+        require(position.currentBalance >= amount, "Insufficient balance");
+        
+        // Update balances
+        position.currentBalance = position.currentBalance.sub(amount);
+        position.totalWithdrawn = position.totalWithdrawn.add(amount);
+        networkBalances[network][token] = networkBalances[network][token].sub(amount);
+        totalTVL = totalTVL.sub(amount);
+        
+        // Transfer ERC20
+        IERC20(token).transfer(msg.sender, amount);
+        
+        emit Withdrawn(msg.sender, network, amount, token);
+    }
+    
+    /**
+     * @dev WITHDRAW TAB - Quick withdraw all ETH (simple one-click)
+     */
+    function quickWithdrawAll() external nonReentrant onlyWhenNotEmergency {
+        UserPosition storage position = userPositions[msg.sender];
+        uint256 userBalance = position.currentBalance;
+        require(userBalance > 0, "No balance to withdraw");
+        
+        position.currentBalance = 0;
+        position.totalWithdrawn = position.totalWithdrawn.add(userBalance);
+        totalTVL = totalTVL.sub(userBalance);
+        
+        // Clear all network balances for this user (simplified)
+        for (uint8 i = 0; i < 5; i++) {
+            networkBalances[Network(i)][address(0)] = networkBalances[Network(i)][address(0)].sub(
+                networkBalances[Network(i)][address(0)] > userBalance ? userBalance : networkBalances[Network(i)][address(0)]
+            );
+        }
+        
+        (bool success, ) = payable(msg.sender).call{value: userBalance}("");
+        require(success, "Withdraw failed");
+        
+        emit Withdrawn(msg.sender, Network.ETHEREUM, userBalance, address(0));
+    }
+    
+    /**
+     * @dev WITHDRAW TAB - Emergency withdrawal (visible in emergency mode only)
+     */
+    function emergencyWithdrawAll() external nonReentrant {
+        require(tradingStatus == TradingStatus.EMERGENCY, "Not in emergency mode");
+        
+        UserPosition storage position = userPositions[msg.sender];
+        uint256 userBalance = position.currentBalance;
+        
+        if (userBalance > 0) {
+            position.currentBalance = 0;
+            position.totalWithdrawn = position.totalWithdrawn.add(userBalance);
+            
+            (bool success, ) = payable(msg.sender).call{value: userBalance}("");
+            require(success, "Emergency transfer failed");
+            
+            emit Withdrawn(msg.sender, Network.ETHEREUM, userBalance, address(0));
+        }
+    }
+    
+    /**
+     * @dev Withdraw funds from specific network
+     */
+    function withdrawFromNetwork(
+        Network network,
+        address token,
+        uint256 amount
+    ) external nonReentrant onlyWhenNotEmergency validNetwork(network) {
+        require(amount > 0, "Amount must be > 0");
+        
+        UserPosition storage position = userPositions[msg.sender];
+        require(position.currentBalance >= amount, "Insufficient balance");
+        
+        // Update balances
+        position.currentBalance = position.currentBalance.sub(amount);
+        position.totalWithdrawn = position.totalWithdrawn.add(amount);
+        networkBalances[network][token] = networkBalances[network][token].sub(amount);
+        totalTVL = totalTVL.sub(amount);
+        
+        // Transfer tokens
+        if (token == address(0)) {
+            // Native token
+            (bool success, ) = payable(msg.sender).call{value: amount}("");
+            require(success, "Transfer failed");
+        } else {
+            // ERC20 token
+            IERC20(token).transfer(msg.sender, amount);
+        }
+        
+        emit Withdrawn(msg.sender, network, amount, token);
+    }
+    
+    /**
+     * @dev Withdraw all funds from all networks
+     */
+    function withdrawAll() external nonReentrant onlyWhenNotEmergency {
+        UserPosition storage position = userPositions[msg.sender];
+        require(position.currentBalance > 0, "No balance to withdraw");
+        
+        uint256 totalAmount = position.currentBalance;
+        position.currentBalance = 0;
+        position.totalWithdrawn = position.totalWithdrawn.add(totalAmount);
+        
+        // Transfer native token (simplified - would need to track per token)
+        (bool success, ) = payable(msg.sender).call{value: totalAmount}("");
+        require(success, "Transfer failed");
+        
+        emit Withdrawn(msg.sender, Network.ETHEREUM, totalAmount, address(0));
+    }
+    
+    /**
+     * @dev Emergency withdrawal (bypasses all checks)
+     */
+    function emergencyWithdraw() external nonReentrant {
+        require(tradingStatus == TradingStatus.EMERGENCY, "Not in emergency mode");
+        
+        UserPosition storage position = userPositions[msg.sender];
+        uint256 userBalance = position.currentBalance;
+        
+        if (userBalance > 0) {
+            position.currentBalance = 0;
+            position.totalWithdrawn = position.totalWithdrawn.add(userBalance);
+            
+            (bool success, ) = payable(msg.sender).call{value: userBalance}("");
+            require(success, "Emergency transfer failed");
+        }
+    }
+    
+    // ==================== AUTO TAB FUNCTIONS (For Remix UI) ====================
+    
+    /**
+     * @dev AUTO TAB - Start auto trading (visible button in Remix)
+     * Use in Remix: call startAuto()
+     */
+    function startAuto() external onlyOwner onlyWhenRunning {
+        require(!autoConfig.enabled, "Auto trading already enabled");
+        autoConfig.enabled = true;
+        
+        emit AutoConfigUpdated(autoConfig);
+        emit TradingStatusChanged(tradingStatus, tradingStatus); // UI update
+    }
+    
+    /**
+     * @dev AUTO TAB - Stop auto trading (visible button in Remix)
+     * Use in Remix: call stopAuto()
+     */
+    function stopAuto() external onlyOwner {
+        require(autoConfig.enabled, "Auto trading not enabled");
+        autoConfig.enabled = false;
+        
+        emit AutoConfigUpdated(autoConfig);
+        emit TradingStatusChanged(tradingStatus, tradingStatus); // UI update
+    }
+    
+    /**
+     * @dev AUTO TAB - Set auto trading parameters (Remix input form)
+     * Use in Remix: call setAutoParams(50, "10000000000000000000", 100, 500000, true)
+     */
+    function setAutoParams(
+        uint256 minProfitPercent,  // 0.5% = 50 basis points
+        uint256 maxTradeSizeWei,   // 10 ETH = 10000000000000000000
+        uint256 slippagePercent,   // 1% = 100 basis points
+        uint256 gasLimit,
+        bool useFlashLoans
+    ) external onlyOwner {
+        autoConfig = AutoTradeConfig({
+            minProfitThreshold: minProfitPercent,
+            maxTradeSize: maxTradeSizeWei,
+            slippageTolerance: slippagePercent,
+            gasLimit: gasLimit,
+            useFlashLoans: useFlashLoans,
+            enabled: autoConfig.enabled
+        });
+        
+        emit AutoConfigUpdated(autoConfig);
+    }
+    
+    /**
+     * @dev AUTO TAB - Execute single auto trade (manual trigger in Remix)
+     * Use in Remix: call executeAutoTradeNow(0, "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "0xdAC17F958D2ee523a2206206994597C13D831ec7", "1000000000000000000")
+     */
+    function executeAutoTradeNow(
+        uint8 networkId,
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn
+    ) external onlyWhenRunning returns (uint256 profit) {
+        Network network = Network(networkId);
+        require(autoConfig.enabled, "Auto trading disabled");
+        require(amountIn <= autoConfig.maxTradeSize, "Exceeds max trade size");
+        
+        // Simulate trade (would integrate with actual DEX)
+        uint256 amountOut = simulateTrade(tokenIn, tokenOut, amountIn);
+        
+        // Calculate profit
+        profit = amountOut.sub(amountIn);
+        require(profit.mul(10000).div(amountIn) >= autoConfig.minProfitThreshold, "Profit below threshold");
+        
+        // Update stats
+        totalTrades++;
+        totalProfits = totalProfits.add(profit);
+        
+        // Update user position
+        UserPosition storage position = userPositions[msg.sender];
+        position.profitLoss = position.profitLoss.add(profit);
+        position.lastTradeTime = block.timestamp;
+        position.currentBalance = position.currentBalance.add(profit);
+        
+        // Emit events for UI updates
+        emit AutoTradeExecuted(msg.sender, network, profit, block.timestamp);
+        emit ProfitDistributed(msg.sender, profit);
+        
+        return profit;
+    }
+    
+    /**
+     * @dev AUTO TAB - Check if auto trading is profitable now (Remix view function)
+     * Use in Remix: call checkAutoProfit("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "0xdAC17F958D2ee523a2206206994597C13D831ec7", "1000000000000000000")
+     */
+    function checkAutoProfit(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn
+    ) external view returns (bool profitable, uint256 expectedProfit) {
+        if (!autoConfig.enabled || tradingStatus != TradingStatus.RUNNING) {
+            return (false, 0);
+        }
+        
+        uint256 amountOut = simulateTrade(tokenIn, tokenOut, amountIn);
+        expectedProfit = amountOut.sub(amountIn);
+        
+        profitable = expectedProfit.mul(10000).div(amountIn) >= autoConfig.minProfitThreshold
+            && amountIn <= autoConfig.maxTradeSize;
+        
+        return (profitable, expectedProfit);
+    }
+    
+    /**
+     * @dev Start auto trading
+     */
+    function startAutoTrading() external onlyOwner onlyWhenRunning {
+        require(!autoConfig.enabled, "Auto trading already enabled");
+        autoConfig.enabled = true;
+        
+        emit AutoConfigUpdated(autoConfig);
+    }
+    
+    /**
+     * @dev Stop auto trading
+     */
+    function stopAutoTrading() external onlyOwner {
+        require(autoConfig.enabled, "Auto trading not enabled");
+        autoConfig.enabled = false;
+        
+        emit AutoConfigUpdated(autoConfig);
+    }
+    
+    /**
+     * @dev Update auto trading configuration
+     */
+    function updateAutoConfig(
+        uint256 minProfitThreshold,
+        uint256 maxTradeSize,
+        uint256 slippageTolerance,
+        uint256 gasLimit,
+        bool useFlashLoans
+    ) external onlyOwner {
+        autoConfig = AutoTradeConfig({
+            minProfitThreshold: minProfitThreshold,
+            maxTradeSize: maxTradeSize,
+            slippageTolerance: slippageTolerance,
+            gasLimit: gasLimit,
+            useFlashLoans: useFlashLoans,
+            enabled: autoConfig.enabled
+        });
+        
+        emit AutoConfigUpdated(autoConfig);
+    }
+    
+    /**
+     * @dev Execute auto trade (simplified - would integrate with DEXes)
+     */
+    function executeAutoTrade(
+        Network network,
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn
+    ) external onlyWhenRunning validNetwork(network) returns (uint256 profit) {
+        require(autoConfig.enabled, "Auto trading disabled");
+        require(amountIn <= autoConfig.maxTradeSize, "Exceeds max trade size");
+        
+        // Simulate trade execution (would integrate with Uniswap/SushiSwap/etc.)
+        uint256 amountOut = simulateTrade(tokenIn, tokenOut, amountIn);
+        
+        // Calculate profit
+        profit = amountOut.sub(amountIn);
+        require(profit.mul(10000).div(amountIn) >= autoConfig.minProfitThreshold, "Profit below threshold");
+        
+        // Update stats
+        totalTrades++;
+        totalProfits = totalProfits.add(profit);
+        
+        // Update user position
+        UserPosition storage position = userPositions[msg.sender];
+        position.profitLoss = position.profitLoss.add(profit);
+        position.lastTradeTime = block.timestamp;
+        
+        // Distribute profits (simplified)
+        distributeProfits(msg.sender, profit);
+        
+        emit AutoTradeExecuted(msg.sender, network, profit, block.timestamp);
+        
+        return profit;
+    }
+    
+    // ==================== STOP BUTTON FUNCTIONS (For Remix UI) ====================
+    
+    /**
+     * @dev STOP BUTTON - Start trading (visible green button in Remix)
+     * Use in Remix: call startTrading()
+     */
+    function startTrading() external onlyOwner {
+        require(tradingStatus != TradingStatus.RUNNING, "Already running");
+        TradingStatus oldStatus = tradingStatus;
+        tradingStatus = TradingStatus.RUNNING;
+        
+        emit TradingStatusChanged(oldStatus, tradingStatus);
+    }
+    
+    /**
+     * @dev STOP BUTTON - Stop trading (visible red button in Remix)
+     * Use in Remix: call stopTrading()
+     */
+    function stopTrading() external onlyOwner {
+        require(tradingStatus == TradingStatus.RUNNING, "Not running");
+        TradingStatus oldStatus = tradingStatus;
+        tradingStatus = TradingStatus.STOPPED;
+        
+        emit TradingStatusChanged(oldStatus, tradingStatus);
+    }
+    
+    /**
+     * @dev STOP BUTTON - Pause trading (yellow button in Remix)
+     * Use in Remix: call pauseTrading()
+     */
+    function pauseTrading() external onlyOwner {
+        require(tradingStatus == TradingStatus.RUNNING, "Not running");
+        TradingStatus oldStatus = tradingStatus;
+        tradingStatus = TradingStatus.PAUSED;
+        
+        emit TradingStatusChanged(oldStatus, tradingStatus);
+    }
+    
+    /**
+     * @dev STOP BUTTON - Resume trading (green button after pause)
+     * Use in Remix: call resumeTrading()
+     */
+    function resumeTrading() external onlyOwner {
+        require(tradingStatus == TradingStatus.PAUSED, "Not paused");
+        TradingStatus oldStatus = tradingStatus;
+        tradingStatus = TradingStatus.RUNNING;
+        
+        emit TradingStatusChanged(oldStatus, tradingStatus);
+    }
+    
+    /**
+     * @dev STOP BUTTON - Emergency stop (big red emergency button)
+     * Use in Remix: call emergencyStop("Market crash detected")
+     */
+    function emergencyStop(string memory reason) external onlyOwner {
+        TradingStatus oldStatus = tradingStatus;
+        tradingStatus = TradingStatus.EMERGENCY;
+        
+        emit EmergencyStopActivated(msg.sender, reason);
+        emit TradingStatusChanged(oldStatus, tradingStatus);
+    }
+    
+    /**
+     * @dev STOP BUTTON - Recover from emergency (unlock button)
+     * Use in Remix: call recoverFromEmergency()
+     */
+    function recoverFromEmergency() external onlyOwner {
+        require(tradingStatus == TradingStatus.EMERGENCY, "Not in emergency");
+        TradingStatus oldStatus = tradingStatus;
+        tradingStatus = TradingStatus.STOPPED;
+        
+        emit TradingStatusChanged(oldStatus, tradingStatus);
+    }
+    
+    /**
+     * @dev STOP BUTTON - Get current trading status (for UI display)
+     * Use in Remix: call getTradingStatus() returns (0=STOPPED, 1=RUNNING, 2=PAUSED, 3=EMERGENCY)
+     */
+    function getTradingStatus() external view returns (uint8) {
+        return uint8(tradingStatus);
+    }
+    
+    /**
+     * @dev STOP BUTTON - Check if trading is active (UI status indicator)
+     * Use in Remix: call isTradingActive() returns true/false
+     */
+    function isTradingActive() external view returns (bool) {
+        return tradingStatus == TradingStatus.RUNNING;
+    }
+    
+    /**
+     * @dev Start trading
+     */
+    function startTrading() external onlyOwner {
+        require(tradingStatus != TradingStatus.RUNNING, "Already running");
+        TradingStatus oldStatus = tradingStatus;
+        tradingStatus = TradingStatus.RUNNING;
+        
+        emit TradingStatusChanged(oldStatus, tradingStatus);
+    }
+    
+    /**
+     * @dev Stop trading
+     */
+    function stopTrading() external onlyOwner {
+        require(tradingStatus == TradingStatus.RUNNING, "Not running");
+        TradingStatus oldStatus = tradingStatus;
+        tradingStatus = TradingStatus.STOPPED;
+        
+        emit TradingStatusChanged(oldStatus, tradingStatus);
+    }
+    
+    /**
+     * @dev Pause trading
+     */
+    function pauseTrading() external onlyOwner {
+        require(tradingStatus == TradingStatus.RUNNING, "Not running");
+        TradingStatus oldStatus = tradingStatus;
+        tradingStatus = TradingStatus.PAUSED;
+        
+        emit TradingStatusChanged(oldStatus, tradingStatus);
+    }
+    
+    /**
+     * @dev Resume trading
+     */
+    function resumeTrading() external onlyOwner {
+        require(tradingStatus == TradingStatus.PAUSED, "Not paused");
+        TradingStatus oldStatus = tradingStatus;
+        tradingStatus = TradingStatus.RUNNING;
+        
+        emit TradingStatusChanged(oldStatus, tradingStatus);
+    }
+    
+    /**
+     * @dev Emergency stop - freezes all operations
+     */
+    function emergencyStop(string memory reason) external onlyOwner {
+        TradingStatus oldStatus = tradingStatus;
+        tradingStatus = TradingStatus.EMERGENCY;
+        
+        emit EmergencyStopActivated(msg.sender, reason);
+        emit TradingStatusChanged(oldStatus, tradingStatus);
+    }
+    
+    /**
+     * @dev Recover from emergency stop
+     */
+    function recoverFromEmergency() external onlyOwner {
+        require(tradingStatus == TradingStatus.EMERGENCY, "Not in emergency");
+        TradingStatus oldStatus = tradingStatus;
+        tradingStatus = TradingStatus.STOPPED;
+        
+        emit TradingStatusChanged(oldStatus, tradingStatus);
+    }
+    
+    // ==================== NETWORK CONFIGURATION ====================
+    
+    /**
+     * @dev Configure a network
+     */
+    function configureNetwork(
+        Network network,
+        address nativeToken,
+        address usdtAddress,
+        address usdcAddress,
+        address wethAddress
+    ) external onlyOwner {
+        networkConfigs[network] = NetworkConfig({
+            nativeToken: nativeToken,
+            usdtAddress: usdtAddress,
+            usdcAddress: usdcAddress,
+            wethAddress: wethAddress,
+            isActive: true
+        });
+    }
+    
+    /**
+     * @dev Disable a network
+     */
+    function disableNetwork(Network network) external onlyOwner {
+        networkConfigs[network].isActive = false;
+    }
+    
+    // ==================== HELPER FUNCTIONS ====================
+    
+    /**
+     * @dev Simulate trade (placeholder - would integrate with price oracles)
+     */
+    function simulateTrade(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn
+    ) internal pure returns (uint256) {
+        // In reality, this would query Uniswap/SushiSwap pools
+        // For demo, return 1% profit
+        return amountIn.mul(101).div(100);
+    }
+    
+    /**
+     * @dev Distribute profits with platform fee
+     */
+    function distributeProfits(address user, uint256 profit) internal {
+        uint256 fee = profit.mul(platformFee).div(10000);
+        uint256 userProfit = profit.sub(fee);
+        
+        // Update user position
+        UserPosition storage position = userPositions[user];
+        position.currentBalance = position.currentBalance.add(userProfit);
+        
+        // Send fee to platform
+        if (fee > 0) {
+            (bool success, ) = payable(feeWallet).call{value: fee}("");
+            require(success, "Fee transfer failed");
+        }
+        
+        emit ProfitDistributed(user, userProfit);
+    }
+    
+    /**
+     * @dev Deposit funds (payable function)
+     */
+    function deposit() external payable nonReentrant onlyWhenNotEmergency {
+        require(msg.value > 0, "Must send ETH");
+        
+        UserPosition storage position = userPositions[msg.sender];
+        position.totalDeposited = position.totalDeposited.add(msg.value);
+        position.currentBalance = position.currentBalance.add(msg.value);
+        position.isActive = true;
+        
+        networkBalances[Network.ETHEREUM][address(0)] = networkBalances[Network.ETHEREUM][address(0)].add(msg.value);
+        totalTVL = totalTVL.add(msg.value);
+        
+        emit Deposited(msg.sender, Network.ETHEREUM, msg.value, address(0));
+    }
+    
+    /**
+     * @dev Deposit ERC20 tokens
+     */
+    function depositERC20(
+        Network network,
+        address token,
+        uint256 amount
+    ) external nonReentrant onlyWhenNotEmergency validNetwork(network) {
+        require(amount > 0, "Amount must be > 0");
+        
+        IERC20(token).transferFrom(msg.sender, address(this), amount);
+        
+        UserPosition storage position = userPositions[msg.sender];
+        position.totalDeposited = position.totalDeposited.add(amount);
+        position.currentBalance = position.currentBalance.add(amount);
+        position.isActive = true;
+        
+        networkBalances[network][token] = networkBalances[network][token].add(amount);
+        totalTVL = totalTVL.add(amount);
+        
+        emit Deposited(msg.sender, network, amount, token);
+    }
+    
+    // ==================== VIEW FUNCTIONS ====================
+    
+    /**
+     * @dev Get user position
+     */
+    function getUserPosition(address user) external view returns (
+        uint256 totalDeposited,
+        uint256 totalWithdrawn,
+        uint256 currentBalance,
+        uint256 lastTradeTime,
+        uint256 profitLoss,
+        bool isActive
+    ) {
+        UserPosition memory position = userPositions[user];
+        return (
+            position.totalDeposited,
+            position.totalWithdrawn,
+            position.currentBalance,
+            position.lastTradeTime,
+            position.profitLoss,
+            position.isActive
+        );
+    }
+    
+    /**
+     * @dev Get network balance
+     */
+    function getNetworkBalance(Network network, address token) external view returns (uint256) {
+        return networkBalances[network][token];
+    }
+    
+    /**
+     * @dev Get contract statistics
+     */
+    function getStats() external view returns (
+        uint256 tvl,
+        uint256 profits,
+        uint256 trades,
+        TradingStatus status,
+        bool autoEnabled
+    ) {
+        return (
+            totalTVL,
+            totalProfits,
+            totalTrades,
+            tradingStatus,
+            autoConfig.enabled
+        );
+    }
+    
+    /**
+     * @dev Check if auto trading conditions are met
+     */
+    function checkAutoTradingConditions() external view returns (bool) {
+        return autoConfig.enabled && 
+               tradingStatus == TradingStatus.RUNNING &&
+               totalTVL > 0;
+    }
+    
+    // Receive function to accept ETH
+    receive() external payable {
+        deposit();
+    }
+    
+    // Fallback function
+    fallback() external payable {
+        deposit();
+    }
+}
